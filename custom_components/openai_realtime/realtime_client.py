@@ -254,7 +254,18 @@ class OpenAIRealtimeClient:
         """Handle incoming WebSocket messages."""
         event_type = data.get("type", "")
 
-        _LOGGER.debug("Received event: %s", event_type)
+        # Verbose by default while we stabilize the GA migration. Drop to
+        # DEBUG once the event-name parity work is settled.
+        if event_type not in ("response.output_audio.delta", "response.output_audio_transcript.delta"):
+            _LOGGER.info("RT event: %s", event_type)
+        if event_type == "response.done":
+            transcript_len = len(self._current_response.audio_transcript) if self._current_response else -1
+            text_len = len(self._current_response.text) if self._current_response else -1
+            output_len = len(self._current_response.output) if self._current_response else -1
+            _LOGGER.info(
+                "RT response.done summary: transcript_len=%d text_len=%d output_count=%d",
+                transcript_len, text_len, output_len,
+            )
 
         # Log function call events specifically
         if "function" in event_type.lower():
