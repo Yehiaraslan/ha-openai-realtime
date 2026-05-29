@@ -184,7 +184,7 @@ class OpenAIRealtimeClient:
         try:
             headers = {
                 "Authorization": f"Bearer {self._api_key}",
-                "OpenAI-Beta": "realtime=v1",
+                
             }
 
             url = f"{OPENAI_REALTIME_WS_URL}?model={self._session_config.model}"
