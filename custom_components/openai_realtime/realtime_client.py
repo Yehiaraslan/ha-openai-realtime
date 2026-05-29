@@ -293,12 +293,26 @@ class OpenAIRealtimeClient:
 
         elif event_type == EVENT_RESPONSE_CREATED:
             response_data = data.get("response", {})
-            self._current_response = RealtimeResponse(
-                id=response_data.get("id", ""),
-                status=response_data.get("status", ""),
+            # If we're in the middle of a tool-call continuation, keep the
+            # existing _current_response so its transcript/output accumulator
+            # spans both responses. Otherwise create a fresh one.
+            continuing = bool(
+                getattr(self, "_pending_function_continuation", False)
+                or getattr(self, "_pending_mcp_continuation", False)
             )
-            self._response_in_progress = True  # Mark response as active
-            _LOGGER.info("Response created: id=%s status=%s", response_data.get("id"), response_data.get("status"))
+            if not continuing or self._current_response is None:
+                self._current_response = RealtimeResponse(
+                    id=response_data.get("id", ""),
+                    status=response_data.get("status", ""),
+                )
+            else:
+                # Track the latest underlying response id but keep accumulated text/audio.
+                self._current_response.id = response_data.get("id", self._current_response.id)
+            self._response_in_progress = True
+            _LOGGER.info(
+                "Response created: id=%s continuing=%s",
+                response_data.get("id"), continuing,
+            )
 
         elif event_type == EVENT_RESPONSE_OUTPUT_TEXT_DELTA:
             if self._current_response:
@@ -330,36 +344,33 @@ class OpenAIRealtimeClient:
             # Mark response as no longer active
             self._response_in_progress = False
             
-            # Check if this response only contained MCP/function calls (no audio)
+            # GA renamed message content "audio" -> "output_audio"; accept both.
             has_audio = False
+            has_text = False
             has_mcp_call = False
             has_function_call = False
             for output in output_items:
                 output_type = output.get("type", "")
-                _LOGGER.debug("Response output item: type=%s role=%s", output_type, output.get("role"))
                 if output_type == "message":
-                    # Check content for audio
                     for content in output.get("content", []):
-                        if content.get("type") == "audio":
+                        ct = content.get("type")
+                        if ct in ("audio", "output_audio"):
                             has_audio = True
+                        elif ct in ("text", "output_text"):
+                            has_text = True
                 elif output_type == "mcp_call":
                     has_mcp_call = True
                 elif output_type == "function_call":
                     has_function_call = True
-            
-            # For MCP calls, do NOT trigger continuation here
-            # The continuation will be triggered on mcp_call.completed event
-            # because mcp_call.in_progress arrives right after response.done
-            # and would block the continuation trigger
+
+            tool_only = (has_mcp_call or has_function_call) and not (has_audio or has_text)
             if has_mcp_call and not has_audio:
-                _LOGGER.debug("Response had MCP calls, waiting for mcp_call.completed to trigger continuation")
-                # Store that we need continuation after MCP completes
                 self._pending_mcp_continuation = True
-            
+            if has_function_call and not has_audio:
+                self._pending_function_continuation = True
+
             if self._current_response:
                 self._current_response.status = response_data.get("status", STATUS_COMPLETED)
-
-                # Extract output items
                 for output in output_items:
                     item = ConversationItem(
                         id=output.get("id", ""),
@@ -370,10 +381,21 @@ class OpenAIRealtimeClient:
                     )
                     self._current_response.output.append(item)
 
-                # Resolve any waiting futures
-                response_id = self._current_response.id
-                if response_id in self._response_futures:
-                    future = self._response_futures.pop(response_id)
+            # Resolution rules:
+            #  - Tool-only response.done: keep the user future pending; the model
+            #    will emit a continuation response after the tool result lands.
+            #  - Final response.done (audio/text/empty-after-tools): resolve all
+            #    pending user futures with the accumulated _current_response.
+            _LOGGER.info(
+                "response.done flags: audio=%s text=%s mcp=%s func=%s tool_only=%s",
+                has_audio, has_text, has_mcp_call, has_function_call, tool_only,
+            )
+            if not tool_only:
+                # Clear continuation flags so the next user turn starts fresh.
+                self._pending_function_continuation = False
+                self._pending_mcp_continuation = False
+                for fid in list(self._response_futures.keys()):
+                    future = self._response_futures.pop(fid)
                     if not future.done():
                         future.set_result(self._current_response)
 
