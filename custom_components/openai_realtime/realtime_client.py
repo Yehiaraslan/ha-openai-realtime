@@ -493,30 +493,36 @@ class OpenAIRealtimeClient:
         else:
             max_tokens_value = max_tokens
         
+        # GA Realtime API shape (post-beta migration, 2025-12+):
+        # - modalities renamed to output_modalities
+        # - voice / formats / turn_detection / transcription nested under audio.{input,output}
+        # - max_response_output_tokens renamed to max_output_tokens
+        # See https://platform.openai.com/docs/api-reference/realtime
+        ga_turn_detection = self._session_config.turn_detection or {
+            "type": "server_vad",
+            "threshold": 0.5,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 500,
+            "create_response": True,
+        }
         session_update: dict[str, Any] = {
-            # GA Realtime API requires session.type. "realtime" preserves the
-            # old beta behavior; switch to "transcription" only for STT-only
-            # sessions. See https://platform.openai.com/docs/api-reference/realtime.
             "type": "realtime",
-            "modalities": ["text", "audio"],
+            "output_modalities": ["audio"],
             "instructions": self._session_config.instructions,
-            "voice": self._session_config.voice,
-            "input_audio_format": AUDIO_FORMAT,
-            "output_audio_format": AUDIO_FORMAT,
-            "input_audio_transcription": {
-                "model": "whisper-1",
-            },
-            "turn_detection": self._session_config.turn_detection or {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500,
-                "create_response": True,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": ga_turn_detection,
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "voice": self._session_config.voice,
+                },
             },
             "tools": self._session_config.tools,
             "tool_choice": "auto",
-            "temperature": self._session_config.temperature,
-            "max_response_output_tokens": max_tokens_value,
+            "max_output_tokens": max_tokens_value,
         }
 
         # Add MCP servers if configured (only SSE servers can be used directly)
