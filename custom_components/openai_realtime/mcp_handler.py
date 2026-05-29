@@ -140,7 +140,15 @@ class MCPTransport(ABC):
 
 
 class SSETransport(MCPTransport):
-    """SSE (Server-Sent Events) transport for MCP."""
+    """Streamable HTTP transport for MCP (kept SSETransport name for back-compat).
+
+    Speaks the modern MCP "Streamable HTTP" transport (single endpoint, sends
+    `Accept: application/json, text/event-stream` and parses either JSON or
+    SSE responses, tracks Mcp-Session-Id). Works against both legacy SSE-only
+    JSON-returning servers and current Streamable HTTP servers.
+    """
+
+    _ACCEPT = "application/json, text/event-stream"
 
     def __init__(
         self,
@@ -148,81 +156,103 @@ class SSETransport(MCPTransport):
         url: str,
         token: str | None = None,
     ) -> None:
-        """Initialize SSE transport."""
         self._session = session
         self._url = url
         self._token = token
         self._connected = False
         self._request_id = 0
+        self._session_id: str | None = None
+
+    def _headers(self) -> dict[str, str]:
+        h = {"Content-Type": "application/json", "Accept": self._ACCEPT}
+        if self._token:
+            h["Authorization"] = f"Bearer {self._token}"
+        if self._session_id:
+            h["Mcp-Session-Id"] = self._session_id
+        return h
+
+    @staticmethod
+    def _parse_sse(body: str) -> dict[str, Any]:
+        """Extract the first JSON-RPC payload from an SSE stream body."""
+        import json as _json
+        for line in body.splitlines():
+            if line.startswith("data:"):
+                chunk = line[5:].strip()
+                if not chunk:
+                    continue
+                try:
+                    return _json.loads(chunk)
+                except _json.JSONDecodeError:
+                    continue
+        return {}
+
+    async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._session.post(
+            self._url, headers=self._headers(), json=payload,
+        ) as response:
+            if sid := response.headers.get("Mcp-Session-Id"):
+                self._session_id = sid
+            ct = response.headers.get("Content-Type", "")
+            if response.status >= 400:
+                return {"error": {"code": response.status, "message": (await response.text())[:500]}}
+            if response.status == 202:
+                return {}
+            text = await response.text()
+            if "text/event-stream" in ct:
+                return self._parse_sse(text)
+            if text and ct.startswith("application/json"):
+                import json as _json
+                return _json.loads(text)
+            return {}
 
     async def connect(self) -> bool:
-        """Connect to the SSE server."""
         try:
-            headers = {"Content-Type": "application/json"}
-            if self._token:
-                headers["Authorization"] = f"Bearer {self._token}"
-
-            # Test connection with initialize
-            async with self._session.post(
-                self._url,
-                headers=headers,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": self._get_request_id(),
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "home-assistant-openai-realtime",
-                            "version": "1.0.0"
-                        }
+            resp = await self._post({
+                "jsonrpc": "2.0",
+                "id": self._get_request_id(),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "home-assistant-openai-realtime",
+                        "version": "1.1.2-zaki",
                     },
                 },
-            ) as response:
-                if response.status == 200:
-                    self._connected = True
-                    return True
+            })
+            if "result" in resp:
+                self._connected = True
+                # Best-effort notifications/initialized; spec-required but
+                # MCP servers tolerate its absence.
+                try:
+                    await self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                except Exception:  # pragma: no cover
+                    pass
+                return True
         except aiohttp.ClientError as e:
-            _LOGGER.error("SSE connection error: %s", e)
+            _LOGGER.error("MCP connect error: %s", e)
         return False
 
     async def disconnect(self) -> None:
-        """Disconnect from the SSE server."""
         self._connected = False
+        self._session_id = None
 
     def _get_request_id(self) -> int:
-        """Get next request ID."""
         self._request_id += 1
         return self._request_id
 
     async def send_request(
         self, method: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Send a JSON-RPC request."""
-        headers = {"Content-Type": "application/json"}
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-
-        request: dict[str, Any] = {
+        payload: dict[str, Any] = {
             "jsonrpc": "2.0",
             "id": self._get_request_id(),
             "method": method,
         }
         if params:
-            request["params"] = params
-
+            payload["params"] = params
         try:
-            async with self._session.post(
-                self._url,
-                headers=headers,
-                json=request,
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    error_text = await response.text()
-                    return {"error": {"code": response.status, "message": error_text}}
+            return await self._post(payload)
         except aiohttp.ClientError as e:
             return {"error": {"code": -1, "message": str(e)}}
 
