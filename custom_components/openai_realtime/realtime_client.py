@@ -494,6 +494,10 @@ class OpenAIRealtimeClient:
             max_tokens_value = max_tokens
         
         session_update: dict[str, Any] = {
+            # GA Realtime API requires session.type. "realtime" preserves the
+            # old beta behavior; switch to "transcription" only for STT-only
+            # sessions. See https://platform.openai.com/docs/api-reference/realtime.
+            "type": "realtime",
             "modalities": ["text", "audio"],
             "instructions": self._session_config.instructions,
             "voice": self._session_config.voice,
